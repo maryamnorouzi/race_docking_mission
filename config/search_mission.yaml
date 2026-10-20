@@ -1,0 +1,141 @@
+/**:
+  ros__parameters:
+    odom_frame: "race_auv/odom"
+    base_frame: "race_auv/base_link"
+    ekf_odom_topic: "/race_auv/odometry/filtered"
+    dock_pose_topic: "/race_station/dock_point/pose"
+    ekf_stale_timeout: 2.0
+
+    # Monitoring only (not used for control in this phase): republishes the
+    # fuser's detection as auv_dock_frame-relative (dock-to-dock, not
+    # dock-to-base_link) on tag_relative_pose_topic.
+    auv_dock_frame: "race_auv/auv_dock_point"
+    tag_relative_pose_topic: "tag_relative_pose"
+    # Monitoring: the station dock point's pose in odom, republished every
+    # detection (see search_mission_node.py's _publish_dock_point_odom()).
+    dock_point_odom_topic: "dock_point_odom"
+
+    # EKF yaw-drift correction: once HOLD first confirms, the station's
+    # pose in odom is frozen as a trusted reference; every detection after
+    # that, the AUV's absolute pose is recomputed from that reference (+)
+    # the fresh detection and published here for robot_localization to
+    # fuse as an absolute-yaw correction (yaw only -- see pose1_config in
+    # robot_localization_sim.yaml).
+    apriltag_absolute_pose_topic: "apriltag_absolute_pose"
+    apriltag_absolute_yaw_covariance: 0.05
+
+    # Phase 1 (search) only. roll/pitch stay 0 throughout -- no pitching
+    # search maneuver in this design, just heave (descend) then yaw (turn).
+    # Staircase descent: leg 0 targets search_first_descend_limit below the
+    # start; leg k>=1 targets search_first_descend_limit +
+    # k*search_descend_step, capped at search_max_depth (default legs:
+    # 1.0, 1.5, 2.0, 2.5, 3.0 m below start). Each leg is descend-then-turn;
+    # no detection at the search_max_depth leg's turn -> ABORT.
+    search_descend_speed: 0.03
+    search_first_descend_limit: 1.0
+    search_descend_step: 0.05
+    search_max_depth: 3.0
+    search_turn_rate_deg_s: 2.0
+    tag_debounce_count: 3
+    tag_detection_gap: 0.3
+
+    # Previous provisional-HOLD-lost-tag creep-back fraction -- replaced by
+    # the reacquire-wobble params below. Kept, not used.
+    hold_creep_fraction: 0.1
+
+    # HOLD is the terminal state of the search mission (no automatic
+    # advance into TAG_LOCKED): once tag_debounce_count consecutive
+    # detections confirm it, the AUV just stays at the pose that sees the
+    # tag. If the tag hasn't been seen for hold_lost_timeout seconds,
+    # search for it again nearby: a slow triangle-wave wobble in z
+    # (+-hold_reacquire_z_amplitude at hold_reacquire_z_speed) and yaw
+    # (+-hold_reacquire_yaw_amplitude_deg at hold_reacquire_yaw_rate_deg_s)
+    # around that pose, until the tag reappears.
+    hold_lost_timeout: 1.0
+    hold_reacquire_z_amplitude: 0.3
+    hold_reacquire_z_speed: 0.03
+    hold_reacquire_yaw_amplitude_deg: 10.0
+    hold_reacquire_yaw_rate_deg_s: 2.0
+
+    # Z1/z2 tracking-error law (see search_mission_node.py's module
+    # docstring / _compute_and_publish_tracking_()). H2 stays a
+    # control-package param. [x, y, z, roll, pitch, yaw].
+    h1_diag: [1.2, 1.1, 1.5, 1.5, 2.1, 1.2]
+
+    # Phase 2 (DOCK_APPROACH, automatic from HOLD) and phase 3 (DOCKING,
+    # manually triggered on start_docking_topic once hovering -- see
+    # _compute_dock_tracking()). Same law, DOCKING just targets the dock
+    # point itself (z offset 0) instead of the hover point.
+    dock_approach_hover_offset_z: 0.3
+    # z1 = (actual-desired)/dock_z1_divisor while further than
+    # dock_near_threshold away; once closer, z1 = the raw (undivided)
+    # difference instead. dot_p_d always uses dock_velocity_divisor.
+    dock_z1_divisor: 10.0
+    dock_velocity_divisor: 15.0
+    # dock_near_threshold: 0.2
+    dock_approach_pos_tol: 0.01
+    # DOCK_APPROACH-only override for the z axis (DOCKING keeps using
+    # dock_z1_divisor/dock_velocity_divisor uniformly for all axes).
+    dock_approach_z1_z_divisor: 5.0
+    dock_approach_velocity_z_divisor: 10.0
+    # Test-only, temporary -- may be removed later: when true, ignores
+    # every divisor above for DOCK_APPROACH -- z1 = the raw relative pose
+    # itself, dot_p_d = 0 for every axis.
+    dock_approach_test_raw_z1_zero_velocity: false
+
+    # DOCKING's own base divisor pair (separate from dock_z1_divisor/
+    # dock_velocity_divisor above, which are DOCK_APPROACH-only). Must be
+    # kept in sync by hand with docking_z1_divisor in
+    # race_docking_control's docking_control.yaml (the integral action
+    # divides by the same value before accumulating).
+    docking_z1_divisor: 2.0
+    docking_velocity_divisor: 5.0
+
+    start_docking_topic: "start_docking"
+    abort_docking_topic: "abort_docking"
+    # HOLD no longer auto-advances into DOCK_APPROACH -- triggered here
+    # instead, same pattern as start_docking_topic.
+    start_approach_topic: "start_approach"
+    # Recovers from KILL back into SEARCH_DESCEND.
+    resume_search_topic: "resume_search"
+    # added by maryam: manual emergency stop from any state -> KILL
+    # (helm 'kill' + mvp_control disabled = zero thrust right away).
+    kill_topic: "kill"
+    controller_enable_service: "/race_auv/controller/set"
+
+    # added by maryam: RETURN_HOME (manual, any state except KILL). Rises
+    # to the start depth first, then moves horizontally + turns to the
+    # start x/y/yaw (saved at startup / resume_search), then holds there.
+    return_home_topic: "return_home"
+    return_home_speed: 0.05            # m/s, horizontal
+    return_home_z_speed: 0.03          # m/s, rise
+    return_home_yaw_rate_deg_s: 2.0    # deg/s
+    return_home_tol: 0.05              # m, "home reached"
+    return_home_xy_gain: 0.2           # 1/s, x/y pull (PID path controls u/v, not x/y)
+
+    # PID path: the frame mvp_control controls (its "current" pose is
+    # this frame in world_ned). The PID setpoint is converted from
+    # base_link to this frame here, because mvp_helm only applies the
+    # odom -> world_ned transform to the setpoint's pose.
+    control_child_frame: "race_auv/cg_link"
+    # PID path, DOCK_APPROACH/DOCKING: the published target only updates
+    # when the dock estimate moves more than this -- mvp_control resets an
+    # axis's integral whenever its setpoint changes.
+    # commented by maryam: hold no longer needed (mvp_control integral fix);
+    # 0 = target updates every tick (original behaviour).
+    # pid_target_pos_tol: 0.03
+    # pid_target_ang_tol_deg: 2.0
+    pid_target_pos_tol: 0.0       # added by maryam
+    pid_target_ang_tol_deg: 0.0   # added by maryam
+
+    # SEARCH_WHILE_APPROACHING: if the tag hasn't been seen for this many
+    # seconds during DOCK_APPROACH, switch into a recovery search -- the
+    # exact same staircase logic as the original search, just a smaller
+    # step and a cap measured from wherever this recovery started (not
+    # search_start_z). Tag found -> back to DOCK_APPROACH; cap reached
+    # with nothing found -> KILL.
+    dock_approach_tag_lost_timeout: 180.0
+    search_while_approaching_descend_step: 0.10
+    search_while_approaching_max_depth_delta: 1.0
+
+    publish_rate: 20.0

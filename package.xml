@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>race_docking_mission</name>
+  <version>0.1.0</version>
+  <description>Search-phase-only mission node for the RACE AUV docking redesign. Publishes desired_odometry (target pose+twist) and actual_odometry (EKF pose+twist, converted to the same odom-consistent representation) for race_docking_control to consume -- no frame-transform work is left for the control package except the final tau-to-thruster mapping.</description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>mvp_msgs</depend>
+  <!-- added by maryam: controller enable/disable for kill -->
+  <depend>std_srvs</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
