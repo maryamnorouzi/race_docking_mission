@@ -74,6 +74,12 @@
     dock_velocity_divisor: 15.0
     # dock_near_threshold: 0.2
     dock_approach_pos_tol: 0.01
+    # added by maryam: DOCKING step 2 -- once x and y (AUV dock-point axes)
+    # are each within this, the PID pose setpoint becomes the constant
+    # (frozen) dock point instead of current - raw_diff/docking_z1_divisor.
+    # commented by maryam: x/y sat at 5-8 cm in sim, step 2 never started
+    # docking_near_tol: 0.05
+    docking_near_tol: 0.10  # added by maryam
     # DOCK_APPROACH-only override for the z axis (DOCKING keeps using
     # dock_z1_divisor/dock_velocity_divisor uniformly for all axes).
     dock_approach_z1_z_divisor: 5.0
@@ -112,6 +118,34 @@
     return_home_yaw_rate_deg_s: 2.0    # deg/s
     return_home_tol: 0.05              # m, "home reached"
     return_home_xy_gain: 0.2           # 1/s, x/y pull (PID path controls u/v, not x/y)
+
+    # added by maryam: PID-path x/y hold against currents (helm 'teleop'
+    # controls u/v, not x/y). Search states/HOLD: desired x/y velocity =
+    # xy_hold_gain*e + xy_hold_ki*int(e) toward the held x/y, capped at
+    # xy_max_speed. DOCK_APPROACH/DOCKING: dock_xy_ki*int(e) added to the
+    # existing velocity setpoint. Integral contribution limited to xy_max_speed.
+    xy_hold_gain: 0.2                  # 1/s
+    xy_hold_ki: 0.02                   # 1/s^2
+    # commented by maryam: saturated at 0.1 against a 7 cm/s sim current
+    # xy_max_speed: 0.1                  # m/s
+    xy_max_speed: 0.3                  # m/s, added by maryam
+    dock_xy_ki: 0.02                   # 1/s^2
+
+    # added by maryam: mission-wide safety limits, timed from the mission
+    # start (first arm, not reset by resume_search). <= 0 disables.
+    max_depth_from_start: 5.0          # m below the start depth -- no setpoint deeper
+    max_depth_kill_margin: 0.2         # m past that limit (actual depth) -> KILL
+    docking_timeout: 3600.0            # s -> KILL if docking not accomplished
+    mission_timeout: 10800.0           # s -> KILL in any state
+
+    # added by maryam: docking accomplished -> DOCKED (keeps holding at the
+    # dock) once, in DOCKING step 2, x/y/z are each within docked_pos_tol and
+    # yaw within docked_yaw_tol_deg for docked_hold_time. Publishes a latched
+    # std_msgs/Bool true on docking_accomplished_topic and stops docking_timeout.
+    docked_pos_tol: 0.02               # m
+    docked_yaw_tol_deg: 3.0            # deg
+    docked_hold_time: 3.0              # s
+    docking_accomplished_topic: "docking_accomplished"
 
     # PID path: the frame mvp_control controls (its "current" pose is
     # this frame in world_ned). The PID setpoint is converted from

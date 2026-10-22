@@ -105,6 +105,7 @@ from mvp_msgs.msg import ControlProcess
 from mvp_msgs.srv import ChangeState
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Empty, Float64MultiArray, String
+from std_msgs.msg import Bool  # added by maryam: docking_accomplished
 from std_srvs.srv import SetBool  # added by maryam: controller enable/disable for kill
 
 from . import frames
@@ -153,6 +154,9 @@ class MissionState(Enum):
     # depth first, then move horizontally (and turn) to the start x/y/yaw,
     # then hold there. See _enter_return_home()/_tick_return_home().
     RETURN_HOME = 'RETURN_HOME'
+    # Added by maryam: docking accomplished (see _tick_docking()); keeps
+    # holding at the dock. Publishes docking_accomplished_topic = true.
+    DOCKED = 'DOCKED'
 
 
 class SearchMissionNode(Node):
@@ -239,6 +243,10 @@ class SearchMissionNode(Node):
         self.declare_parameter('dock_velocity_divisor', 15.0)
         self.declare_parameter('dock_near_threshold', 0.2)
         self.declare_parameter('dock_approach_pos_tol', 0.1)
+        # Added by maryam: DOCKING step 2 -- once x and y (AUV dock-point
+        # axes) are each within this, the PID pose setpoint becomes the
+        # constant (frozen) dock point. See _tick_docking().
+        self.declare_parameter('docking_near_tol', 0.05)
         # DOCK_APPROACH-only override for the z axis (DOCKING keeps using
         # dock_z1_divisor/dock_velocity_divisor uniformly for all axes).
         self.declare_parameter('dock_approach_z1_z_divisor', 20.0)
@@ -280,6 +288,30 @@ class SearchMissionNode(Node):
         self.declare_parameter('return_home_yaw_rate_deg_s', 2.0)  # deg/s
         self.declare_parameter('return_home_tol', 0.05)            # m, arrival
         self.declare_parameter('return_home_xy_gain', 0.2)         # 1/s, x/y pull
+        # Added by maryam: PID path x/y hold against currents. The helm's
+        # 'teleop' mode controls u/v, not x/y, so u = v = 0 lets a current
+        # push the AUV away. Search states/HOLD: desired x/y velocity =
+        # xy_hold_gain*e + xy_hold_ki*int(e), e = hold x/y - EKF x/y,
+        # capped at xy_max_speed. DOCK_APPROACH/DOCKING: dock_xy_ki*int(e)
+        # added to the existing velocity setpoint. The integral lives here
+        # because mvp_control zeroes its own u/v integral on every
+        # setpoint change. See _xy_hold_velocity()/_publish_dock_pid_setpoint().
+        self.declare_parameter('xy_hold_gain', 0.2)    # 1/s
+        self.declare_parameter('xy_hold_ki', 0.02)     # 1/s^2
+        self.declare_parameter('xy_max_speed', 0.1)    # m/s, also the integral limit
+        self.declare_parameter('dock_xy_ki', 0.02)     # 1/s^2
+        # Added by maryam: mission-wide safety limits -- see
+        # _check_mission_limits(). Times are from the mission start (first
+        # arm); <= 0 disables that limit.
+        self.declare_parameter('max_depth_from_start', 5.0)    # m below the start depth
+        self.declare_parameter('max_depth_kill_margin', 0.2)   # m past it -> KILL
+        self.declare_parameter('docking_timeout', 3600.0)      # s, KILL if not docked
+        self.declare_parameter('mission_timeout', 10800.0)     # s, KILL in any state
+        # Added by maryam: docking accomplished -> DOCKED, see _tick_docking().
+        self.declare_parameter('docked_pos_tol', 0.02)          # m, each of x/y/z
+        self.declare_parameter('docked_yaw_tol_deg', 3.0)       # deg
+        self.declare_parameter('docked_hold_time', 3.0)         # s, continuously inside
+        self.declare_parameter('docking_accomplished_topic', 'docking_accomplished')
 
         # SEARCH_WHILE_APPROACHING (see _enter_search_while_approaching()):
         # if the tag hasn't been seen for this many seconds while in
@@ -329,6 +361,7 @@ class SearchMissionNode(Node):
         self._dock_velocity_divisor = float(self.get_parameter('dock_velocity_divisor').value)
         self._dock_near_threshold = float(self.get_parameter('dock_near_threshold').value)
         self._dock_approach_pos_tol = float(self.get_parameter('dock_approach_pos_tol').value)
+        self._docking_near_tol = float(self.get_parameter('docking_near_tol').value)  # added by maryam
         self._dock_approach_z1_z_divisor = float(
             self.get_parameter('dock_approach_z1_z_divisor').value)
         self._dock_approach_velocity_z_divisor = float(
@@ -446,6 +479,10 @@ class SearchMissionNode(Node):
         self._docking_reached = False
         self._docking_frozen_pos: Optional[tuple[float, float, float]] = None
         self._docking_frozen_quat: Optional[tuple[float, float, float, float]] = None
+        # Added by maryam: DOCKING step 2 (x/y within docking_near_tol).
+        self._docking_near = False
+        self._docking_near_pos: Optional[tuple[float, float, float]] = None
+        self._docking_near_quat: Optional[tuple[float, float, float, float]] = None
 
         self._ekf_pos: Optional[tuple[float, float, float]] = None
         self._ekf_quat: Optional[tuple[float, float, float, float]] = None
@@ -611,6 +648,38 @@ class SearchMissionNode(Node):
         self._return_home_sub = self.create_subscription(
             Empty, self.get_parameter('return_home_topic').value, self._on_return_home, 10,
         )
+        # Added by maryam: x/y hold + safety limits (see the params above).
+        self._xy_hold_gain = float(self.get_parameter('xy_hold_gain').value)
+        self._xy_hold_ki = float(self.get_parameter('xy_hold_ki').value)
+        self._xy_max_speed = float(self.get_parameter('xy_max_speed').value)
+        self._dock_xy_ki = float(self.get_parameter('dock_xy_ki').value)
+        self._max_depth_from_start = float(self.get_parameter('max_depth_from_start').value)
+        self._max_depth_kill_margin = float(self.get_parameter('max_depth_kill_margin').value)
+        self._docking_timeout = float(self.get_parameter('docking_timeout').value)
+        self._mission_timeout = float(self.get_parameter('mission_timeout').value)
+        self._xy_hold_int = np.zeros(2)
+        self._xy_hold_last_time: Optional[float] = None
+        self._dock_xy_int = np.zeros(2)
+        self._dock_xy_last_time: Optional[float] = None
+        self._mission_start_time: Optional[float] = None  # first _arm(), never reset
+        self._mission_start_z: Optional[float] = None
+        # commented by maryam: the docking-accomplished check exists now
+        # # Set by the docking-accomplished check (not added yet) -- until
+        # # then docking_timeout always fires.
+        # added by maryam: set when DOCKED is reached (stops docking_timeout)
+        self._docking_accomplished = False
+        self._docked_pos_tol = float(self.get_parameter('docked_pos_tol').value)
+        self._docked_yaw_tol = math.radians(float(self.get_parameter('docked_yaw_tol_deg').value))
+        self._docked_hold_time = float(self.get_parameter('docked_hold_time').value)
+        self._docked_since: Optional[float] = None
+        # Latched, so anyone subscribing later still gets the last value.
+        self._docking_accomplished_pub = self.create_publisher(
+            Bool, self.get_parameter('docking_accomplished_topic').value,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        _init_msg = Bool()
+        _init_msg.data = False
+        self._docking_accomplished_pub.publish(_init_msg)
 
         # ---------------- Timer ----------------
         self._node_start_time = self._now_seconds()
@@ -844,6 +913,17 @@ class SearchMissionNode(Node):
         # added by maryam: RETURN_HOME sets x/y velocity; search never does
         self._target_vx = 0.0
         self._target_vy = 0.0
+        # added by maryam: mission start (time + depth) for the safety
+        # limits -- recorded once, not again on resume_search.
+        if self._mission_start_time is None:
+            self._mission_start_time = now_s
+            self._mission_start_z = float(self._ekf_pos[2])
+            self.get_logger().info(
+                f"Mission start: depth limit {self._max_depth_from_start:.1f} m below "
+                f"z={self._mission_start_z:.2f}, docking timeout {self._docking_timeout:.0f} s, "
+                f"mission timeout {self._mission_timeout:.0f} s")
+        self._xy_hold_int = np.zeros(2)
+        self._xy_hold_last_time = None
         self.get_logger().info(
             f"Home (start point) saved: ({self._home_pos[0]:.2f}, {self._home_pos[1]:.2f}, "
             f"{self._home_pos[2]:.2f}, yaw={math.degrees(self._home_yaw):.1f} deg)")
@@ -953,6 +1033,9 @@ class SearchMissionNode(Node):
         self._dock_approach_reached = False
         self._dock_approach_frozen_pos = None
         self._dock_approach_frozen_quat = None
+        # added by maryam: fresh docking x/y integral (kept into DOCKING)
+        self._dock_xy_int = np.zeros(2)
+        self._dock_xy_last_time = None
         self.get_logger().info("-> DOCK_APPROACH")
         self._publish_state()
 
@@ -961,6 +1044,7 @@ class SearchMissionNode(Node):
             z1_divisor: Optional[float] = None, velocity_divisor: Optional[float] = None,
             z1_z_divisor: Optional[float] = None, velocity_z_divisor: Optional[float] = None,
             test_raw_z1_zero_velocity: bool = False,
+            pid_constant_target: bool = False,  # added by maryam, see _tick_docking()
     ) -> Optional[tuple[np.ndarray, tuple[float, float, float, float], np.ndarray]]:
         """Shared math for DOCK_APPROACH/DOCKING (identical law, only the
         target and base divisors differ): actual = the AUV's dock point
@@ -1083,6 +1167,11 @@ class SearchMissionNode(Node):
         else:
             z1_scale = 1.0 / z1_divisors
             vel_scale = 1.0 / vel_divisors
+        # added by maryam: DOCKING step 2 -- PID pose setpoint = the
+        # (frozen) target itself: current - 1*raw_diff = target. PID only;
+        # the RBF Z1/z2 above are unchanged. Velocity setpoint unchanged.
+        if pid_constant_target:
+            z1_scale = np.ones(6)
         self._publish_dock_pid_setpoint(
             auv_pos, auv_quat, desired_pos, desired_quat, z1_scale, vel_scale)
 
@@ -1103,6 +1192,15 @@ class SearchMissionNode(Node):
         reached with nothing found -> KILL.
         """
         self._phase = MissionState.SEARCH_WHILE_APPROACHING
+        # added by maryam: search (and hold x/y) from where the AUV is now,
+        # not the stale HOLD/search targets from before DOCK_APPROACH.
+        self._target_x = float(self._ekf_pos[0])
+        self._target_y = float(self._ekf_pos[1])
+        self._target_z = float(self._ekf_pos[2])
+        self._target_yaw = yaw_from_quaternion(*self._ekf_quat)
+        self._target_vx = self._target_vy = 0.0
+        self._xy_hold_int = np.zeros(2)
+        self._xy_hold_last_time = None
         self._active_search_start_z = self._ekf_pos[2]
         self._active_search_first_limit = self._swa_descend_step
         self._active_search_step = self._swa_descend_step
@@ -1183,6 +1281,11 @@ class SearchMissionNode(Node):
         self._docking_reached = False
         self._docking_frozen_pos = None
         self._docking_frozen_quat = None
+        # added by maryam: start in step 1
+        self._docked_since = None
+        self._docking_near = False
+        self._docking_near_pos = None
+        self._docking_near_quat = None
         self.get_logger().info("DOCK_APPROACH -> DOCKING")
         self._publish_state()
 
@@ -1190,6 +1293,10 @@ class SearchMissionNode(Node):
         if self._docking_reached:
             desired_pos = np.asarray(self._docking_frozen_pos, dtype=float)
             desired_quat = self._docking_frozen_quat
+        # added by maryam: step 2 -- constant (frozen) dock point
+        elif self._docking_near:
+            desired_pos = np.asarray(self._docking_near_pos, dtype=float)
+            desired_quat = self._docking_near_quat
         else:
             # Recorded pose, same as _tick_dock_approach() -- see
             # _publish_dock_point_odom().
@@ -1198,14 +1305,40 @@ class SearchMissionNode(Node):
             desired_pos = np.array(self._dock_point_odom_pos, dtype=float)  # z offset 0
             desired_quat = self._dock_point_odom_quat
 
+        # commented by maryam: replaced by the call below (adds pid_constant_target)
+        # result = self._compute_dock_tracking(
+        #     desired_pos, desired_quat,
+        #     z1_divisor=self._docking_z1_divisor,
+        #     velocity_divisor=self._docking_velocity_divisor,
+        # )
+        # added by maryam: in step 2 the PID pose setpoint is the dock point
+        # itself (undivided), not current - raw_diff/divisor.
         result = self._compute_dock_tracking(
             desired_pos, desired_quat,
             z1_divisor=self._docking_z1_divisor,
             velocity_divisor=self._docking_velocity_divisor,
+            pid_constant_target=(self._docking_near or self._docking_reached),
         )
         if result is None:
             return
-        _auv_pos, _auv_quat, raw_diff_pos = result
+        # commented by maryam: _auv_quat is used now (step 2 check below)
+        # _auv_pos, _auv_quat, raw_diff_pos = result
+        _auv_pos, auv_quat, raw_diff_pos = result  # added by maryam
+
+        # added by maryam: step 1 -> step 2 when x and y (AUV dock-point
+        # axes, i.e. what tag_relative_pose shows) are each within
+        # docking_near_tol; z is ignored -- step 2 is what closes z.
+        if not self._docking_near:
+            e_body = rotation_matrix_from_quaternion(*auv_quat).T @ raw_diff_pos
+            if (abs(e_body[0]) <= self._docking_near_tol
+                    and abs(e_body[1]) <= self._docking_near_tol):
+                self._docking_near = True
+                self._docking_near_pos = tuple(float(v) for v in desired_pos)
+                self._docking_near_quat = desired_quat
+                self.get_logger().info(
+                    f"DOCKING step 2: x/y within {self._docking_near_tol:.2f} m "
+                    f"(x={e_body[0]:+.3f}, y={e_body[1]:+.3f}, z={e_body[2]:+.3f}) "
+                    f"-> constant dock point setpoint")
 
         dist = float(np.linalg.norm(raw_diff_pos))
         if dist < self._dock_approach_pos_tol and not self._docking_reached:
@@ -1213,6 +1346,36 @@ class SearchMissionNode(Node):
             self._docking_frozen_pos = tuple(desired_pos)
             self._docking_frozen_quat = desired_quat
             self.get_logger().info("DOCKING: dock point reached, staying there")
+
+        # added by maryam: docking accomplished -- x, y, z each within
+        # docked_pos_tol and yaw within docked_yaw_tol_deg (AUV dock-point
+        # axes), continuously for docked_hold_time -> DOCKED. DOCKED keeps
+        # running this same tick, i.e. keeps holding at the dock.
+        if self._phase == MissionState.DOCKING and self._docking_near:
+            e_body = rotation_matrix_from_quaternion(*auv_quat).T @ raw_diff_pos
+            q_d = frames.quat_mul(desired_quat, _DOCK_YAW_CORRECTION)
+            yaw_err = wrap_to_pi(yaw_from_quaternion(*auv_quat) - yaw_from_quaternion(*q_d))
+            inside = (bool(np.all(np.abs(e_body) <= self._docked_pos_tol))
+                      and abs(yaw_err) <= self._docked_yaw_tol)
+            if not inside:
+                self._docked_since = None
+            elif self._docked_since is None:
+                self._docked_since = now_s
+            elif now_s - self._docked_since >= self._docked_hold_time:
+                self._enter_docked(e_body, yaw_err)
+
+    # added by maryam
+    def _enter_docked(self, e_body: np.ndarray, yaw_err: float) -> None:
+        self._phase = MissionState.DOCKED
+        self._docking_accomplished = True  # stops docking_timeout
+        self.get_logger().info(
+            f"DOCKING ACCOMPLISHED: x={e_body[0]:+.3f} y={e_body[1]:+.3f} "
+            f"z={e_body[2]:+.3f} m, yaw={math.degrees(yaw_err):+.1f} deg "
+            f"for {self._docked_hold_time:.0f} s -> DOCKED (holding at the dock)")
+        msg = Bool()
+        msg.data = True
+        self._docking_accomplished_pub.publish(msg)
+        self._publish_state()
 
     def _publish_orientation_error_deg(self, raw_diff_ang: np.ndarray) -> None:
         """Monitoring only: raw_diff_ang (actual - desired, straight from
@@ -1383,6 +1546,17 @@ class SearchMissionNode(Node):
             # the integral on setpoint change. desired = current - raw_diff/divisor.
             carrot_dock_pos = auv_pos - z1_scale[0:3] * raw_diff_pos
             v_dock_odom = -vel_scale[0:3] * raw_diff_pos
+            # added by maryam: mission-side integral on the horizontal dock
+            # error (mvp_control resets its u/v integral every tick). Its
+            # contribution is limited to xy_max_speed per axis.
+            now_s = self._now_seconds()
+            dt = (0.0 if self._dock_xy_last_time is None
+                  else min(max(now_s - self._dock_xy_last_time, 0.0), 0.5))
+            self._dock_xy_last_time = now_s
+            if self._dock_xy_ki > 0.0:
+                lim = self._xy_max_speed / self._dock_xy_ki
+                self._dock_xy_int = np.clip(self._dock_xy_int + raw_diff_pos[0:2] * dt, -lim, lim)
+                v_dock_odom[0:2] -= self._dock_xy_ki * self._dock_xy_int
 
             cur_rpy = np.asarray(rpy_from_quaternion(*auv_quat), dtype=float)
             tgt_rpy = np.asarray(rpy_from_quaternion(*tgt_quat), dtype=float)
@@ -1453,6 +1627,11 @@ class SearchMissionNode(Node):
                     f"{self._control_child_frame} yet", throttle_duration_sec=5.0)
                 return
             off_pos, off_quat = self._control_child_offset
+            # added by maryam: depth limit -- no PID setpoint (search, HOLD,
+            # docking, return home) deeper than max_depth_from_start.
+            floor_z = self._depth_floor_z()
+            if floor_z is not None and desired_pos[2] < floor_z:
+                desired_pos = (desired_pos[0], desired_pos[1], floor_z)
             child_pos, child_quat = frames.compose(
                 desired_pos, quaternion_from_rpy(*desired_rpy), off_pos, off_quat)
             child_rpy = rpy_from_quaternion(*child_quat)
@@ -1608,6 +1787,9 @@ class SearchMissionNode(Node):
                 return  # waiting for the first EKF sample to arm
             self._arm(now_s)
 
+        # added by maryam: depth limit + mission/docking timeouts
+        self._check_mission_limits(now_s)
+
         if self._phase == MissionState.SEARCH_DESCEND:
             self._tick_search_descend(now_s)
         elif self._phase == MissionState.SEARCH_TURN:
@@ -1622,13 +1804,27 @@ class SearchMissionNode(Node):
         elif self._phase == MissionState.DOCK_APPROACH:
             self._tick_dock_approach(now_s)
             return  # publishes its own desired/actual + Z1/z2
-        elif self._phase == MissionState.DOCKING:
+        # commented by maryam: DOCKED also runs _tick_docking() (keeps holding)
+        # elif self._phase == MissionState.DOCKING:
+        elif self._phase in (MissionState.DOCKING, MissionState.DOCKED):  # added by maryam
             self._tick_docking(now_s)
             return  # publishes its own desired/actual + Z1/z2
         # added by maryam
         elif self._phase == MissionState.RETURN_HOME:
             self._tick_return_home(now_s)
         # KILL: target is already frozen, nothing to update.
+
+        # added by maryam: never target deeper than the depth limit
+        floor_z = self._depth_floor_z()
+        if floor_z is not None and self._target_z < floor_z:
+            self._target_z = floor_z
+            self._target_vz = max(self._target_vz, 0.0)
+
+        # added by maryam: PID-path x/y hold in the search states and HOLD
+        pid_xy_vel = None
+        if self._phase in (MissionState.SEARCH_DESCEND, MissionState.SEARCH_TURN,
+                           MissionState.SEARCH_WHILE_APPROACHING, MissionState.HOLD):
+            pid_xy_vel = self._xy_hold_velocity(now_s)
 
         self._publish_desired()
         self._publish_actual()
@@ -1640,7 +1836,58 @@ class SearchMissionNode(Node):
             desired_rpy=(self._target_roll, self._target_pitch, self._target_yaw),
             desired_pos_dot=(self._target_vx, self._target_vy, self._target_vz),
             desired_rpy_dot=(self._target_roll_rate, self._target_pitch_rate, self._target_yaw_rate),
+            pid_xy_vel_odom=pid_xy_vel,  # added by maryam
         )
+
+    # added by maryam: safety limits + x/y hold ----------------------------
+
+    def _depth_floor_z(self) -> Optional[float]:
+        """Deepest allowed odom z (z up): mission start depth minus
+        max_depth_from_start. None before the mission has started."""
+        if self._mission_start_z is None or self._max_depth_from_start <= 0.0:
+            return None
+        return self._mission_start_z - self._max_depth_from_start
+
+    def _check_mission_limits(self, now_s: float) -> None:
+        """KILL (any state) when the mission has run mission_timeout, when
+        docking hasn't been accomplished within docking_timeout, or when
+        the AUV is more than max_depth_kill_margin past the depth limit."""
+        if self._phase == MissionState.KILL or self._mission_start_time is None:
+            return
+        elapsed = now_s - self._mission_start_time
+        if self._mission_timeout > 0.0 and elapsed > self._mission_timeout:
+            self._enter_kill(f"mission timeout ({self._mission_timeout:.0f} s)")
+            return
+        if (self._docking_timeout > 0.0 and not self._docking_accomplished
+                and elapsed > self._docking_timeout):
+            self._enter_kill(f"docking not accomplished within {self._docking_timeout:.0f} s")
+            return
+        floor_z = self._depth_floor_z()
+        if (floor_z is not None and self._ekf_pos is not None
+                and self._ekf_pos[2] < floor_z - self._max_depth_kill_margin):
+            depth = self._mission_start_z - self._ekf_pos[2]
+            self._enter_kill(
+                f"depth limit exceeded ({depth:.2f} m below start > "
+                f"{self._max_depth_from_start:.1f} m + {self._max_depth_kill_margin:.1f} m)")
+
+    def _xy_hold_velocity(self, now_s: float) -> tuple[float, float]:
+        """Desired x/y velocity (odom) holding _target_x/_target_y:
+        xy_hold_gain*e + xy_hold_ki*int(e), e = target - EKF, total
+        capped at xy_max_speed; the integral is limited so its part alone
+        never exceeds xy_max_speed."""
+        if self._ekf_pos is None:
+            return 0.0, 0.0
+        dt = 0.0 if self._xy_hold_last_time is None else min(max(now_s - self._xy_hold_last_time, 0.0), 0.5)
+        self._xy_hold_last_time = now_s
+        e = np.array([self._target_x - self._ekf_pos[0], self._target_y - self._ekf_pos[1]])
+        if self._xy_hold_ki > 0.0:
+            lim = self._xy_max_speed / self._xy_hold_ki
+            self._xy_hold_int = np.clip(self._xy_hold_int + e * dt, -lim, lim)
+        v = self._xy_hold_gain * e + self._xy_hold_ki * self._xy_hold_int
+        speed = float(np.linalg.norm(v))
+        if speed > self._xy_max_speed > 0.0:
+            v *= self._xy_max_speed / speed
+        return float(v[0]), float(v[1])
 
     def _check_ekf_staleness(self, now_s: float) -> None:
         if self._phase == MissionState.KILL:
@@ -1951,6 +2198,7 @@ class SearchMissionNode(Node):
         desired_rpy: tuple[float, float, float],
         desired_pos_dot: tuple[float, float, float],
         desired_rpy_dot: tuple[float, float, float],
+        pid_xy_vel_odom: Optional[tuple[float, float]] = None,  # added by maryam
     ) -> None:
         """Backstepping tracking-error law: computed here (mission), not in
         race_docking_control, which now only ever sees Z1/z2 -- already
@@ -2004,7 +2252,14 @@ class SearchMissionNode(Node):
         # Previous (commented by maryam): only u/v were sent.
         # desired_vel_body_xy = (r.T @ np.asarray(desired_pos_dot, dtype=float))[0:2]
         # self._publish_direct_control_setpoint(desired_pos, desired_rpy, desired_vel_body_xy)
-        lin_vel_body = r.T @ np.asarray(desired_pos_dot, dtype=float)
+        # commented by maryam: replaced below (PID-only x/y hold velocity)
+        # lin_vel_body = r.T @ np.asarray(desired_pos_dot, dtype=float)
+        # added by maryam: the PID path's x/y velocity can come from the x/y
+        # hold (see _xy_hold_velocity()); the RBF Z1/z2 above are unchanged.
+        pid_pos_dot = np.array(desired_pos_dot, dtype=float)
+        if pid_xy_vel_odom is not None:
+            pid_pos_dot[0:2] = pid_xy_vel_odom
+        lin_vel_body = r.T @ pid_pos_dot
         ang_vel_body = t_inv @ np.asarray(desired_rpy_dot, dtype=float)
         self._publish_direct_control_setpoint(desired_pos, desired_rpy, lin_vel_body, ang_vel_body)
 
